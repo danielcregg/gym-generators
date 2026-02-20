@@ -1,574 +1,646 @@
+"""
+Combined Economic and Emission Dispatch (CEED) Gymnasium Environment.
+
+This module implements a custom Gymnasium environment for training reinforcement
+learning agents to solve the 10-generator, 24-hour combined economic and emission
+dispatch problem. The agent controls 9 generators (units 2-10) while unit 1 serves
+as the slack generator that balances supply and demand.
+
+Bugs fixed from original:
+    1. Unreachable termination condition (n==11 check after n reset)
+    2. Inconsistent states_array indexing
+    3. Math bug in get_p_1_m (P_n*B[n][j]*P_n -> P_n*B[n][j]*P_j)
+    4. Mutable class variables shared across instances
+    5. Missing observation_space
+    6. Reward zeroed out after computation for intermediate steps
+
+Migrated from OpenAI Gym to Gymnasium (5-tuple step, seed/options reset).
+"""
+
 import sys
 import math
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 import numpy as np
-import pandas as pd  # import pandas to use pandas DataFrame
+import pandas as pd
 from math import sin, exp
 
 
 class GeneratorsEnv(gym.Env):
-    """Class for Generators environment"""
-    metadata = {'render.modes': ['human']}
+    """Gymnasium environment for Combined Economic and Emission Dispatch (CEED).
 
-    # Set constants
-    M = 24      # M = number of hours in day = Number of States
-    N = 10      # N = number of generators (1 slack, 9 agent controlled)
+    The environment models a 10-generator power system over a 24-hour scheduling
+    horizon. At each step, the RL agent selects a discrete power level (0-100) for
+    one generator at one hour. After all 9 controllable generators are set for an
+    hour, the slack generator (unit 1) is computed to balance supply and demand.
+
+    Observation:
+        A float32 vector containing:
+        - Normalized current hour (m / M)
+        - Normalized current generator index ((n - 2) / (N - 1))
+        - Power levels of all 10 generators for the current hour (normalized)
+        - Current hour demand (normalized)
+        - Previous hour total cost (normalized)
+        - Previous hour total emissions (normalized)
+
+    Actions:
+        Discrete(101) - integer from 0 to 100 representing percentage of the
+        generator's power range (0 = p_min, 100 = p_max).
+
+    Reward:
+        Negative weighted sum of fuel cost, emissions, and constraint penalties.
+        Dense rewards are provided at each generator step.
+    """
+
+    metadata = {"render_modes": ["human"], "render_fps": 1}
+
+    # System constants
+    M = 24      # Number of hours in a day
+    N = 10      # Number of generators (1 slack + 9 agent-controlled)
     E = 10      # Emissions scaling factor
-    Wc = 0.225  # Cost weight used for linear scalarisation
-    We = 0.275  # Emissions weight used for linear scalarisation
-    Wp = 0.5    # Power weight used for linear scalarisation
-    C = 10E6    # C is the violation constant
-    states_array = np.zeros([M*N,2]) # 10 gens
-    
+    Wc = 0.225  # Cost weight for linear scalarisation
+    We = 0.275  # Emissions weight for linear scalarisation
+    Wp = 0.5    # Penalty weight for linear scalarisation
+    C = 10e6    # Violation penalty constant
 
-    # DataFrame created with generator data in the form of list of tuples
+    # Generator characteristics DataFrame
     gen_chars = pd.DataFrame(
-        [(150, 470, 786.7988, 38.5397, 0.1524, 450, 0.041, 103.3908, -2.4444,   0.0312, 0.5035, 0.0207, 80, 80),
-         (135, 470, 451.3251, 46.1591, 0.1058, 600, 0.036, 103.3908, -2.4444, 0.0312, 0.5035, 0.0207, 80, 80),
-         (73, 340, 1049.9977, 40.3965, 0.0280, 320, 0.028, 300.3910, -4.0695, 0.0509, 0.4968, 0.0202, 80, 80),
-         (60, 300, 1243.5311, 38.3055, 0.0354, 260, 0.052, 300.3910, -4.0695, 0.0509, 0.4968, 0.0202, 50, 50),
-         (73, 243, 1658.5696, 36.3278, 0.0211, 280, 0.063, 320.0006, -3.8132, 0.0344, 0.4972, 0.0200, 50, 50),
-         (57, 160, 1356.6592, 38.2704, 0.0179, 310, 0.048, 320.0006, -3.8132, 0.0344, 0.4972, 0.0200, 50, 50),
-         (20, 130, 1450.7045, 36.5104, 0.0121, 300, 0.086, 330.0056, -3.9023, 0.0465, 0.5163, 0.0214, 30, 30),
-         (47, 120, 1450.7045, 36.5104, 0.0121, 340, 0.082, 330.0056, -3.9023, 0.0465, 0.5163, 0.0214, 30, 30),
-         (20, 80, 1455.6056, 39.5804, 0.1090, 270, 0.098, 350.0056, -3.9524, 0.0465, 0.5475, 0.0234, 30, 30),
-         (10, 55, 1469.4026, 40.5407, 0.1295, 380, 0.094, 360.0012, -3.9864, 0.0470, 0.5475, 0.0234, 30, 30)],
-        columns=["p_min_i", "p_max_i", "a_i", "b_i", "c_i", "d_i", "e_i", "alpha_i", "beta_i", "gamma_i", "eta_i", "delta_i", "ur_i", "dr_i"],
-        index=["unit1", "unit2", "unit3", "unit4", "unit5", "unit6", "unit7", "unit8", "unit9", "unit10"])
+        [
+            (150, 470, 786.7988, 38.5397, 0.1524, 450, 0.041,
+             103.3908, -2.4444, 0.0312, 0.5035, 0.0207, 80, 80),
+            (135, 470, 451.3251, 46.1591, 0.1058, 600, 0.036,
+             103.3908, -2.4444, 0.0312, 0.5035, 0.0207, 80, 80),
+            (73, 340, 1049.9977, 40.3965, 0.0280, 320, 0.028,
+             300.3910, -4.0695, 0.0509, 0.4968, 0.0202, 80, 80),
+            (60, 300, 1243.5311, 38.3055, 0.0354, 260, 0.052,
+             300.3910, -4.0695, 0.0509, 0.4968, 0.0202, 50, 50),
+            (73, 243, 1658.5696, 36.3278, 0.0211, 280, 0.063,
+             320.0006, -3.8132, 0.0344, 0.4972, 0.0200, 50, 50),
+            (57, 160, 1356.6592, 38.2704, 0.0179, 310, 0.048,
+             320.0006, -3.8132, 0.0344, 0.4972, 0.0200, 50, 50),
+            (20, 130, 1450.7045, 36.5104, 0.0121, 300, 0.086,
+             330.0056, -3.9023, 0.0465, 0.5163, 0.0214, 30, 30),
+            (47, 120, 1450.7045, 36.5104, 0.0121, 340, 0.082,
+             330.0056, -3.9023, 0.0465, 0.5163, 0.0214, 30, 30),
+            (20, 80, 1455.6056, 39.5804, 0.1090, 270, 0.098,
+             350.0056, -3.9524, 0.0465, 0.5475, 0.0234, 30, 30),
+            (10, 55, 1469.4026, 40.5407, 0.1295, 380, 0.094,
+             360.0012, -3.9864, 0.0470, 0.5475, 0.0234, 30, 30),
+        ],
+        columns=[
+            "p_min_i", "p_max_i", "a_i", "b_i", "c_i", "d_i", "e_i",
+            "alpha_i", "beta_i", "gamma_i", "eta_i", "delta_i", "ur_i", "dr_i",
+        ],
+        index=[f"unit{i}" for i in range(1, 11)],
+    )
 
-    # B is the matrix of transmission line loss coefficients
-    # data in the form of list of tuples
+    # B-coefficient loss matrix (10x10)
     B = pd.DataFrame(
-        [(0.000049, 0.000014, 0.000015, 0.000015, 0.000016, 0.000017, 0.000017,  0.000018, 0.000019, 0.000020),
-         (0.000014, 0.000045, 0.000016, 0.000016, 0.000017, 0.000015, 0.000015, 0.000016, 0.000018, 0.000018),
-         (0.000015, 0.000016, 0.000039, 0.000010, 0.000012, 0.000012, 0.000014, 0.000014, 0.000016, 0.000016),
-         (0.000015, 0.000016, 0.000010, 0.000040, 0.000014, 0.000010, 0.000011, 0.000012, 0.000014, 0.000015),
-         (0.000016, 0.000017, 0.000012, 0.000014, 0.000035, 0.000011, 0.000013, 0.000013, 0.000015, 0.000016),
-         (0.000017, 0.000015, 0.000012, 0.000010, 0.000011, 0.000036, 0.000012, 0.000012, 0.000014, 0.000015),
-         (0.000017, 0.000015, 0.000014, 0.000011, 0.000013, 0.000012, 0.000038, 0.000016, 0.000016, 0.000018),
-         (0.000018, 0.000016, 0.000014, 0.000012, 0.000013, 0.000012, 0.000016, 0.000040, 0.000015, 0.000016),
-         (0.000019, 0.000018, 0.000016, 0.000014, 0.000015, 0.000014, 0.000016, 0.000015, 0.000042, 0.000019),
-         (0.000020, 0.000018, 0.000016, 0.000015, 0.000016, 0.000015, 0.000018, 0.000016, 0.000019, 0.000044)])
+        [
+            (0.000049, 0.000014, 0.000015, 0.000015, 0.000016,
+             0.000017, 0.000017, 0.000018, 0.000019, 0.000020),
+            (0.000014, 0.000045, 0.000016, 0.000016, 0.000017,
+             0.000015, 0.000015, 0.000016, 0.000018, 0.000018),
+            (0.000015, 0.000016, 0.000039, 0.000010, 0.000012,
+             0.000012, 0.000014, 0.000014, 0.000016, 0.000016),
+            (0.000015, 0.000016, 0.000010, 0.000040, 0.000014,
+             0.000010, 0.000011, 0.000012, 0.000014, 0.000015),
+            (0.000016, 0.000017, 0.000012, 0.000014, 0.000035,
+             0.000011, 0.000013, 0.000013, 0.000015, 0.000016),
+            (0.000017, 0.000015, 0.000012, 0.000010, 0.000011,
+             0.000036, 0.000012, 0.000012, 0.000014, 0.000015),
+            (0.000017, 0.000015, 0.000014, 0.000011, 0.000013,
+             0.000012, 0.000038, 0.000016, 0.000016, 0.000018),
+            (0.000018, 0.000016, 0.000014, 0.000012, 0.000013,
+             0.000012, 0.000016, 0.000040, 0.000015, 0.000016),
+            (0.000019, 0.000018, 0.000016, 0.000014, 0.000015,
+             0.000014, 0.000016, 0.000015, 0.000042, 0.000019),
+            (0.000020, 0.000018, 0.000016, 0.000015, 0.000016,
+             0.000015, 0.000018, 0.000016, 0.000019, 0.000044),
+        ]
+    )
 
-    # self.state = np.array([0.0,74.0,148.0,148.0,74.0,148.0,74.0,74.0,148.0,98.0,84.0,44.0,-78.0,-148.0,-148.0,-222.0,
-    # -74.0,148.0,148.0,196.0,-48.0,-296.0,-296.0,-148.0])
-
-    # data in the form of list of tuples
-    hour_power_demand = pd.DataFrame([1036, 1110, 1258, 1406, 1480, 1628, 1702,    1776, 1924, 2022, 2106, 2150, 2072, 1924, 1776, 1554, 1480, 1628,          1776, 1972, 1924, 1628, 1332, 1184],
+    # Hourly power demand (MW)
+    hour_power_demand = pd.DataFrame(
+        [1036, 1110, 1258, 1406, 1480, 1628, 1702, 1776, 1924, 2022,
+         2106, 2150, 2072, 1924, 1776, 1554, 1480, 1628, 1776, 1972,
+         1924, 1628, 1332, 1184],
         columns=["p_d_n"],
-        index=["hour1", "hour2", "hour3", "hour4", "hour5", "hour6", "hour7",         "hour8", "hour9", "hour10", "hour11", "hour12", "hour13",              "hour14", "hour15", "hour16", "hour17", "hour18", "hour19",            "hour20", "hour21","hour22", "hour23", "hour24"])
+        index=[f"hour{i}" for i in range(1, 25)],
+    )
 
-    hour_power_demand_diff = hour_power_demand.diff().fillna(0.)  # Get diff values and fill NaN with 0.0
+    hour_power_demand_diff = hour_power_demand.diff().fillna(0.0)
+    hour_power_demand_diff.rename(columns={"p_d_n": "delta_p_d"}, inplace=True)
 
-    hour_power_demand_diff.rename(columns={'p_d_n':'delta_p_d'}, inplace=True)
+    # Normalisation constants for observation space
+    _MAX_POWER = 470.0   # Largest p_max across all generators
+    _MAX_DEMAND = 2150.0  # Peak demand
+    _MAX_COST = 100000.0  # Approximate max hourly cost for normalisation
+    _MAX_EMISSIONS = 100000.0  # Approximate max hourly emissions
 
-    states = hour_power_demand_diff.assign(p_n_m_prev=0.)  # Add new column and set all rows to 0.0_
+    def __init__(self, render_mode=None):
+        """Initialise the Generators environment.
 
-    # data in the form of list of tuples
-    p_n_m_df = pd.DataFrame(0., columns=["hour1", "hour2", "hour3", "hour4", "hour5", "hour6", "hour7", "hour8", "hour9", "hour10", "hour11", "hour12", "hour13", "hour14", "hour15", "hour16", "hour17", "hour18", "hour19", "hour20", "hour21","hour22", "hour23", "hour24"], index=["unit1", "unit2", "unit3", "unit4", "unit5", "unit6", "unit7", "unit8", "unit9", "unit10"])
-        
-    def __init__(self):
-        print("Generators Environment Initialising...")
-        self.action_space = spaces.Discrete(101)  # Set with 101 elements {0, 1, 2 ... 100}
-        self.states_array.fill(0.)
-        state_fill = 0
-        for n in range(1, self.N + 1): #Looping inclusive range
-            self.states_array[state_fill] = [0. , self.set_random_p_n_m(n)]
-            state_fill += self.M
-        # set power demand deltas
-        m = 0
-        for state in range(0, len(self.states_array)):
-            self.states_array[state][0] = self.hour_power_demand_diff.iloc[m , 0]
-            m+=1
-            if m == 24:
-                m=0
+        Args:
+            render_mode: Optional render mode (only 'human' supported).
+        """
+        super().__init__()
+        self.render_mode = render_mode
 
-        #self.m = self.states.index.get_loc("hour1") # m = current Hour = 0
-        self.m = 1 
-        #self.state = self.states_array[self.m]
-        
-        self.n = 2 # start at unit 2
-        
-        #self.states.iloc[self.m, self.states.columns.get_loc("p_n_m_prev")] = #self.gen_chars.loc[self.active_unit, "p_min_i"]
+        # BUG FIX 4: Instance-level mutable state (not class-level)
+        self.states_array = np.zeros([self.M * self.N, 2])
+        self.p_n_m_df = pd.DataFrame(
+            0.0,
+            columns=[f"hour{i}" for i in range(1, 25)],
+            index=[f"unit{i}" for i in range(1, 11)],
+        )
 
-        #self.state = self.states.iloc[self.m, : ]
-        #self.state = self.states.loc["hour1", : ]
-        # for unit in self.p_n_m.index:
-        #     # Start all generators at min power value
-        #     #self.p_n_m["hour1"][unit] = self.gen_chars["p_min_i"][unit]
-        #     #Start all generators at random power value within discrete range
-        #     self.p_n_m["hour1"][unit] = self.gen_chars["p_min_i"][unit] + ((self.gen_chars["p_max_i"][unit] - self.gen_chars["p_min_i"][unit]) * (np.random.randint(0, 101)/100))
-        # print(self.p_n_m)
-        self.state = 1
-        self.reward = 0
-        self.done = 0
-        self.add = [0, 0]
-        print("Generators Environment Initialised...")
+        # Action space: discrete 0-100 (percentage of generator power range)
+        self.action_space = spaces.Discrete(101)
 
-    def show_unit_characteristics(self, unit):
-        print("Unit Name:", unit)
-        print(self.gen_chars.loc[unit, :])
+        # BUG FIX 5: Define observation_space
+        # Observation vector: [hour_norm, gen_norm, 10 gen powers, demand, prev_cost, prev_emissions]
+        obs_dim = 2 + self.N + 3  # = 15
+        self.observation_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32
+        )
 
-    def set_random_p_n_m(self, n):
-        # if type(n) == str:
-        #     assert n in self.gen_chars.index, "%r (%s) invalid unit" % (n,type(n))
-        #     p_n_m = self.gen_chars["p_min_i"][n] + ((self.gen_chars["p_max_i"][n] - self.gen_chars["p_min_i"][n]) * (np.random.randint(0, 101)/100))
-        # elif type(n) == int:
-        assert  type(n) == int and n > 0 and n <= self.N, "%r (%s) invalid unit" % (n,type(n))
-        
-        p_min_i_col_loc = self.gen_chars.columns.get_loc("p_min_i") # = 0
-        p_max_i_col_loc = self.gen_chars.columns.get_loc("p_max_i") # = 1
+        # Episode state
+        self.m = 1       # Current hour (1-indexed)
+        self.n = 2       # Current generator (1-indexed, start at 2; 1 is slack)
+        self.reward = 0.0
+        self.done = False
+        self.prev_cost = 0.0
+        self.prev_emissions = 0.0
 
-        p_n_min = self.gen_chars.iloc[n - 1, p_min_i_col_loc]
-        p_n_max = self.gen_chars.iloc[n - 1, p_max_i_col_loc]
+    def _init_states_array(self):
+        """Initialise the states_array with random starting power levels and demand diffs."""
+        self.states_array.fill(0.0)
+        for n in range(1, self.N + 1):
+            idx = (n - 1) * self.M
+            self.states_array[idx] = [0.0, self._random_power(n)]
+        # Fill demand diffs
+        m_idx = 0
+        for state_idx in range(len(self.states_array)):
+            self.states_array[state_idx][0] = self.hour_power_demand_diff.iloc[m_idx, 0]
+            m_idx += 1
+            if m_idx == 24:
+                m_idx = 0
 
-        p_n_m = p_n_min + ((p_n_max - p_n_min) * (np.random.randint(0, self.action_space.n)/100))
-        return p_n_m
+    def _random_power(self, n):
+        """Generate a random power output for generator n within its bounds.
+
+        Args:
+            n: Generator number (1-indexed).
+
+        Returns:
+            Random power value between p_min and p_max for generator n.
+        """
+        assert isinstance(n, int) and 1 <= n <= self.N
+        p_min = self.gen_chars.iloc[n - 1, 0]  # p_min_i
+        p_max = self.gen_chars.iloc[n - 1, 1]  # p_max_i
+        action = self.np_random.integers(0, self.action_space.n)
+        return p_min + (p_max - p_min) * (action / 100.0)
+
+    def _build_observation(self):
+        """Build the observation vector for the current state.
+
+        Returns:
+            numpy.ndarray of shape (obs_dim,) with float32 dtype.
+        """
+        hour_norm = (self.m - 1) / max(self.M - 1, 1)
+        gen_norm = (self.n - 2) / max(self.N - 2, 1)
+
+        # Power levels of all generators for current hour (normalised)
+        gen_powers = np.zeros(self.N, dtype=np.float32)
+        for i in range(self.N):
+            gen_powers[i] = self.p_n_m_df.iloc[i, self.m - 1] / self._MAX_POWER
+
+        demand_norm = self.get_p_d_m(self.m) / self._MAX_DEMAND
+        cost_norm = np.clip(self.prev_cost / self._MAX_COST, -1.0, 1.0)
+        emis_norm = np.clip(self.prev_emissions / self._MAX_EMISSIONS, -1.0, 1.0)
+
+        obs = np.array(
+            [hour_norm, gen_norm] + gen_powers.tolist() + [demand_norm, cost_norm, emis_norm],
+            dtype=np.float32,
+        )
+        return np.clip(obs, -1.0, 1.0)
 
     def set_p_n_m_a(self, n, m, action):
-        assert  type(n) == int and n > 1 and n <= self.N, "%r (%s) invalid unit" % (n,type(n))
-        assert  type(m) == int and m > 0 and m <= self.M, "%r (%s) invalid hour" % (m,type(m))
-        assert self.action_space.contains(action), "%r (%s) invalid" % (action,type(action))
-        
-        p_min_i_col_loc = self.gen_chars.columns.get_loc("p_min_i") # = 0
-        p_max_i_col_loc = self.gen_chars.columns.get_loc("p_max_i") # = 1
+        """Set power output for generator n at hour m based on a discrete action.
 
-        p_n_min = self.gen_chars.iloc[n - 1, p_min_i_col_loc]
-        p_n_max = self.gen_chars.iloc[n - 1, p_max_i_col_loc]
-    
-        p_n_m_a = p_n_min + ((p_n_max - p_n_min) * (action/100))
-        self.p_n_m_df.iloc[n -1, m - 1] = p_n_m_a
-        if (n <= 10 and m < 24):  
-          self.states_array[((n - 1) * self.M) + m][1] = p_n_m_a
+        Args:
+            n: Generator number (2-10, 1-indexed).
+            m: Hour (1-24, 1-indexed).
+            action: Discrete action in [0, 100].
+
+        Returns:
+            The power level set for the generator (MW).
+        """
+        assert isinstance(n, int) and 2 <= n <= self.N
+        assert isinstance(m, int) and 1 <= m <= self.M
+        assert self.action_space.contains(action)
+
+        p_min = self.gen_chars.iloc[n - 1, 0]
+        p_max = self.gen_chars.iloc[n - 1, 1]
+        p_n_m_a = p_min + (p_max - p_min) * (action / 100.0)
+
+        self.p_n_m_df.iloc[n - 1, m - 1] = p_n_m_a
+
+        # BUG FIX 2: Consistent indexing formula: (n-1)*M + (m-1) for current hour
+        self.states_array[((n - 1) * self.M) + (m - 1)][1] = p_n_m_a
+        # Also store in next slot for prev-hour lookups if valid
+        if m < self.M:
+            self.states_array[((n - 1) * self.M) + m][1] = p_n_m_a
         return p_n_m_a
 
-    def get_p_d_m(self, m):  # Input m = the hour
-        if type(m) == str:
-            assert m in self.hour_power_demand.index, "%r (%s) invalid hour" % (m,type(m))
-            p_d_m = self.hour_power_demand.loc[m, "p_d_n"]
-        elif type(m) == int:
-            assert  type(m) == int and m > 0 and m <= self.M, "%r (%s) invalid hour" % (m,type(m))
-            p_d_n_col_loc = self.hour_power_demand.columns.get_loc("p_d_n")
-            p_d_m = self.hour_power_demand.iloc[m - 1, p_d_n_col_loc]
-        return p_d_m
-    
-    def get_p_d_m_prev(self, m):  # Input m = the hour
-        if type(m) == str:
-            assert m in self.hour_power_demand.index and m != "hour1", "%r (%s) invalid hour" % (m,type(m))
-            m = self.hour_power_demand.index.get_loc(m) + 1
-        elif type(m) == int:
-            assert  type(m) == int and m > 1 and m <= self.M, "%r (%s) invalid hour" % (m,type(m))
-        return self.get_p_d_m(m-1)
+    def get_p_d_m(self, m):
+        """Get power demand at hour m.
 
-    # Find the power output of a generator unit - Adgent chooes this ... 
-    # Need to work on this after i figure out rewards system
-    def get_p_n_m(self, n, m):  # Input n = generator unit number
-        if type(n) == str:
-            assert n in self.p_n_m_df.index, "%r (%s) invalid hour" % (n,type(n))
+        Args:
+            m: Hour (1-24, 1-indexed).
+
+        Returns:
+            Power demand in MW.
+        """
+        assert isinstance(m, int) and 1 <= m <= self.M
+        return self.hour_power_demand.iloc[m - 1, 0]
+
+    def get_p_n_m(self, n, m):
+        """Get power output of generator n at hour m.
+
+        Args:
+            n: Generator number (1-10).
+            m: Hour (1-24).
+
+        Returns:
+            Power output in MW.
+        """
+        if isinstance(n, str):
             n = self.p_n_m_df.index.get_loc(n) + 1
-        if type(m) == str:  
-            assert m in self.p_n_m_df.columns, "%r (%s) invalid hour" % (m,type(m))
+        if isinstance(m, str):
             m = self.p_n_m_df.columns.get_loc(m) + 1
-        assert  type(n) == int and n > 0 and n <= self.N, "%r (%s) invalid hour" % (n,type(n))
-        assert  type(m) == int and m > 0 and m <= self.M, "%r (%s) invalid hour" % (m,type(m))
-        return self.p_n_m_df.iloc[n -1, m - 1]
+        assert isinstance(n, int) and 1 <= n <= self.N
+        assert isinstance(m, int) and 1 <= m <= self.M
+        return self.p_n_m_df.iloc[n - 1, m - 1]
 
-    def get_p_n_m_prev(self, n, m):  # Input n = generator unit number
-        if type(n) == str:
-            assert n in self.p_n_m_df.index, "%r (%s) invalid hour" % (n,type(n))
+    def get_p_n_m_prev(self, n, m):
+        """Get power output of generator n at the previous hour (for ramp constraints).
+
+        For hour 1, returns the initial random power stored in states_array.
+
+        Args:
+            n: Generator number (1-10).
+            m: Current hour (1-24).
+
+        Returns:
+            Power output from previous hour in MW.
+        """
+        if isinstance(n, str):
             n = self.p_n_m_df.index.get_loc(n) + 1
-        if type(m) == str:  
-            assert m in self.p_n_m_df.columns, "%r (%s) invalid hour" % (m,type(m))
+        if isinstance(m, str):
             m = self.p_n_m_df.columns.get_loc(m) + 1
-        assert  type(n) == int and n > 0 and n <= self.N, "%r (%s) invalid hour" % (n,type(n))
-        assert  type(m) == int and m > 0 and m <= self.M, "%r (%s) invalid hour" % (m,type(m))
-        return self.states_array[((n-1)  * self.M) + (m - 1)][1]
+        assert isinstance(n, int) and 1 <= n <= self.N
+        assert isinstance(m, int) and 1 <= m <= self.M
 
-
+        if m == 1:
+            # Return initial power from states_array
+            return self.states_array[((n - 1) * self.M)][1]
+        else:
+            return self.p_n_m_df.iloc[n - 1, m - 2]
 
     def get_f_c_l(self, n, m):
-        assert  type(n) == int and n > 0 and n <= self.N, "%r (%s) invalid hour" % (n,type(n))
-        assert  type(m) == int and m > 0 and m <= self.M, "%r (%s) invalid hour" % (m,type(m))
-        # Find required column numbers
-        a_n_col_loc = self.gen_chars.columns.get_loc("a_i")
-        b_n_col_loc = self.gen_chars.columns.get_loc("b_i")
-        c_n_col_loc = self.gen_chars.columns.get_loc("c_i")
-        d_n_col_loc = self.gen_chars.columns.get_loc("d_i")
-        e_n_col_loc = self.gen_chars.columns.get_loc("e_i")
-        p_min_n_col_loc = self.gen_chars.columns.get_loc("p_min_i")
-        
-        # Get required coefficients
-        a_n = self.gen_chars.iloc[n - 1, a_n_col_loc]
-        b_n = self.gen_chars.iloc[n - 1, b_n_col_loc]
-        c_n = self.gen_chars.iloc[n - 1, c_n_col_loc]
-        d_n = self.gen_chars.iloc[n - 1, d_n_col_loc]
-        e_n = self.gen_chars.iloc[n - 1, e_n_col_loc]
-        p_min_n = self.gen_chars.iloc[n - 1, p_min_n_col_loc]
+        """Calculate fuel cost for generator n at hour m.
 
+        Uses the valve-point cost function:
+            F_c = a + b*P + c*P^2 + |d*sin(e*(P_min - P))|
+
+        Args:
+            n: Generator number (1-10).
+            m: Hour (1-24).
+
+        Returns:
+            Fuel cost in $/h.
+        """
+        assert isinstance(n, int) and 1 <= n <= self.N
+        assert isinstance(m, int) and 1 <= m <= self.M
+
+        gc = self.gen_chars.iloc[n - 1]
+        a_n = gc["a_i"]
+        b_n = gc["b_i"]
+        c_n = gc["c_i"]
+        d_n = gc["d_i"]
+        e_n = gc["e_i"]
+        p_min_n = gc["p_min_i"]
         p_n_m = self.get_p_n_m(n, m)
-        
-        return round(a_n + (b_n * p_n_m) + c_n * (p_n_m ** 2) + abs(d_n * sin(e_n * (p_min_n - p_n_m))), 2)
+
+        return a_n + b_n * p_n_m + c_n * p_n_m**2 + abs(d_n * sin(e_n * (p_min_n - p_n_m)))
 
     def get_f_c_g(self, m):
-        assert  type(m) == int and m > 0 and m <= self.M, "%r (%s) invalid hour" % (m,type(m))
-        global_cost = 0
-        for n in range (1,self.N+1):
-            global_cost += self.get_f_c_l(n, m)
-        return round(global_cost, 2)
+        """Calculate total fuel cost across all generators at hour m.
+
+        Args:
+            m: Hour (1-24).
+
+        Returns:
+            Total fuel cost in $/h.
+        """
+        assert isinstance(m, int) and 1 <= m <= self.M
+        return sum(self.get_f_c_l(n, m) for n in range(1, self.N + 1))
 
     def get_f_e_l(self, n, m):
-        assert  type(n) == int and n > 0 and n <= self.N, "%r (%s) invalid hour" % (n,type(n))
-        assert  type(m) == int and m > 0 and m <= self.M, "%r (%s) invalid hour" % (m,type(m))
-                # Find required column numbers
-        alpha_n_col_loc = self.gen_chars.columns.get_loc("alpha_i")
-        beta_n_col_loc = self.gen_chars.columns.get_loc("beta_i")
-        gamma_n_col_loc = self.gen_chars.columns.get_loc("gamma_i")
-        eta_n_col_loc = self.gen_chars.columns.get_loc("eta_i")
-        delta_n_col_loc = self.gen_chars.columns.get_loc("delta_i")
-                
-        # Get required coefficients
-        alpha_n = self.gen_chars.iloc[n - 1, alpha_n_col_loc]
-        beta_n = self.gen_chars.iloc[n - 1, beta_n_col_loc]
-        gamma_n = self.gen_chars.iloc[n - 1, gamma_n_col_loc]
-        eta_n = self.gen_chars.iloc[n - 1, eta_n_col_loc]
-        delta_n = self.gen_chars.iloc[n - 1, delta_n_col_loc]
-        
+        """Calculate emissions for generator n at hour m.
+
+        Uses the emission function:
+            F_e = E * (alpha + beta*P + gamma*P^2 + eta*exp(delta*P))
+
+        Args:
+            n: Generator number (1-10).
+            m: Hour (1-24).
+
+        Returns:
+            Emissions (scaled by E).
+        """
+        assert isinstance(n, int) and 1 <= n <= self.N
+        assert isinstance(m, int) and 1 <= m <= self.M
+
+        gc = self.gen_chars.iloc[n - 1]
+        alpha_n = gc["alpha_i"]
+        beta_n = gc["beta_i"]
+        gamma_n = gc["gamma_i"]
+        eta_n = gc["eta_i"]
+        delta_n = gc["delta_i"]
         p_n_m = self.get_p_n_m(n, m)
-        
-        return self.E * (alpha_n + (beta_n * p_n_m) + gamma_n * (p_n_m ** 2) + eta_n * exp(delta_n * p_n_m))
+
+        return self.E * (alpha_n + beta_n * p_n_m + gamma_n * p_n_m**2 + eta_n * exp(delta_n * p_n_m))
 
     def get_f_e_g(self, m):
-        global_emissions = 0
-        for n in range (1,self.N+1):
-            global_emissions += self.get_f_e_l(n, m)
-        return global_emissions
+        """Calculate total emissions across all generators at hour m.
 
-    # Find the power loss of a generator unit 
-    # Need to work on this after i figure out rewards system
-    def get_p_l_m(self, m):  # Input m = the hour
-        #if type(m) == str:
-        #    assert m in self.hour_power_demand.index, "%r (%s) invalid hour" % (m,type(m))
-        #    assert n in self.gen_chars.index, "%r (%s) invalid hour" % (n,type(n))
-        #    p_l_m = 0 # 
-        #elif type(m) == int:
-        #p_m_loc = self.gen_chars.rows.get_iloc(m)
-        assert  type(m) == int and m > 0 and m <= self.M, "%r (%s) invalid hour" % (m,type(m))
+        Args:
+            m: Hour (1-24).
 
-        sum1=0
-        sum2=0
-        
-        for n in range(2, self.N + 1):
-            sum1+=self.B[1-1][n-1] * self.get_p_n_m(n, m)
+        Returns:
+            Total emissions.
+        """
+        return sum(self.get_f_e_l(n, m) for n in range(1, self.N + 1))
 
-        for n in range(2, self.N + 1):    
-            for j in range(2, self.N + 1):
-                sum2+=self.get_p_n_m(n, m)*self.B[n-1][j-1]*self.get_p_n_m(j, m)
-
-        # Define coefficients of Quadratic equation
-        a=self.B[1-1][1-1]
-        b=2*sum1
-        c=sum2
-               
-        # calculate the discriminant
-        d = (b**2) - (4*a*c)
-        if d < 0:
-            print("d = ",d)
-            sys.exit("\np_l_m has no real solution as d < 0")
-        elif d == 0:  # Quadratic has one solution
-            p_l_m = -b/(2*a)
-            return p_l_m
-        else:
-            p_l_m1 = (-b+math.sqrt(d))/(2*a)
-            p_l_m2 = (-b-math.sqrt(d))/(2*a)
-            return p_l_m1, p_l_m2
-
-    # Find the Power output of the slack generator at a given hour m
     def get_p_1_m(self, m):
-        # Solve the quadratic equation ax**2 + bx + c = 0
-        assert m > 0 and m <= self.M, "%r (%s) invalid hour" % (m,type(m))
-        sum_b=0
-        sum_c1=0
-        sum_c2=0
-        
-        for n in range(2, self.N + 1):
-            sum_b += self.B[1-1][n-1] * self.get_p_n_m(n, m)
-        
-        for n in range(2, self.N + 1):    
-            for j in range(2, self.N + 1):
-                sum_c1+=self.get_p_n_m(n, m)*self.B[n-1][j-1]*self.get_p_n_m(n, m)
-        
-        for n in range(2, self.N + 1): 
-            sum_c2+=self.get_p_n_m(n, m)
-        
-        # Define coefficients of Quadratic equation
-        a=self.B[1-1][1-1]
-        b=(2*sum_b) - 1
-        c=self.get_p_d_m(m) + sum_c1 - sum_c2
+        """Calculate the slack generator (unit 1) power output at hour m.
 
-        # calculate the discriminant
-        d = (b**2) - (4*a*c)
+        Solves the quadratic power balance equation:
+            P_d + P_loss = sum(P_n)
+        where P_loss depends on all generator outputs via the B-matrix.
+
+        BUG FIX 3: The inner loop now correctly uses P_j (not P_n) in the
+        B-matrix product: sum_c1 += P_n * B[n][j] * P_j
+
+        Args:
+            m: Hour (1-24).
+
+        Returns:
+            Slack generator power output in MW.
+        """
+        assert 1 <= m <= self.M
+
+        sum_b = 0.0
+        sum_c1 = 0.0
+        sum_c2 = 0.0
+
+        for n in range(2, self.N + 1):
+            sum_b += self.B[0][n - 1] * self.get_p_n_m(n, m)
+
+        for n in range(2, self.N + 1):
+            P_n = self.get_p_n_m(n, m)
+            for j in range(2, self.N + 1):
+                # BUG FIX 3: Use P_j, not P_n for the second factor
+                P_j = self.get_p_n_m(j, m)
+                sum_c1 += P_n * self.B[n - 1][j - 1] * P_j
+
+        for n in range(2, self.N + 1):
+            sum_c2 += self.get_p_n_m(n, m)
+
+        # Quadratic coefficients: a*P1^2 + b*P1 + c = 0
+        a = self.B[0][0]
+        b = (2 * sum_b) - 1
+        c = self.get_p_d_m(m) + sum_c1 - sum_c2
+
+        d = b**2 - 4 * a * c
         if d < 0:
-            print("d = ",d)
-            sys.exit("p_l_m has no real solution as d < 0")
-        elif d == 0:  # Quadratic has one solution
-            p_1_m = -b/(2*a)
-            return p_1_m
+            # Fallback: return demand minus other generators (ignore losses)
+            p_1_m = self.get_p_d_m(m) - sum_c2
+        elif d == 0:
+            p_1_m = -b / (2 * a)
         else:
-            #p_1_m1 = (-b+math.sqrt(d))/(2*a)
-            p_1_m2 = (-b-math.sqrt(d))/(2*a)
-            if m<24:
-                self.states_array[m][1] = p_1_m2
-            return p_1_m2  #p_1_m1, p_1_m2
+            p_1_m = (-b - math.sqrt(d)) / (2 * a)
+
+        # Store in dataframe and states_array
+        self.p_n_m_df.iloc[0, m - 1] = p_1_m
+        self.states_array[m - 1][1] = p_1_m
+        return p_1_m
 
     def get_f_p_g(self, m):
-        #print("This is the Global Penalty Function")
-        p_1_m = self.get_p_1_m(m)
+        """Calculate global penalty for constraint violations at hour m.
+
+        Checks capacity and ramp-rate constraints for the slack generator (unit 1).
+
+        Args:
+            m: Hour (1-24).
+
+        Returns:
+            Penalty value (0 if no violations).
+        """
+        p_1_m = self.get_p_n_m(1, m)
         p_1_max = self.gen_chars.loc["unit1", "p_max_i"]
         p_1_min = self.gen_chars.loc["unit1", "p_min_i"]
         p_1_m_prev = self.get_p_n_m_prev(1, m)
         ur1 = self.gen_chars.loc["unit1", "ur_i"]
         dr1 = self.gen_chars.loc["unit1", "dr_i"]
-        
-        delta1 = 0 # delta = 0 if no violation in constraint else 1 if the constraint is violated
-        delta2 = 0
 
+        # Capacity constraint
+        h1 = 0.0
+        delta1 = 0
         if p_1_m > p_1_max:
             h1 = p_1_m - p_1_max
-            delta1 = 1 # delta = 0 if no violation in constraint else 1 if the constraint is violated
-        elif p_1_m < p_1_min: 
+            delta1 = 1
+        elif p_1_m < p_1_min:
             h1 = p_1_min - p_1_m
-            delta1 = 1 # delta = 0 if no violation in constraint else 1 if the constraint is violated
-        else:
-            h1 = 0
-            delta1 = 0 # delta = 0 if no violation in constraint else 1 if the constraint is violated
+            delta1 = 1
 
-        if (p_1_m - p_1_m_prev) > ur1:
-            h2 = (p_1_m - p_1_m_prev) - ur1
+        # Ramp-rate constraint
+        h2 = 0.0
+        delta2 = 0
+        ramp = p_1_m - p_1_m_prev
+        if ramp > ur1:
+            h2 = ramp - ur1
             delta2 = 1
-        elif (p_1_m - p_1_m_prev) < -dr1: 
-            h2 = (p_1_m - p_1_m_prev) + dr1
+        elif ramp < -dr1:
+            h2 = ramp + dr1
             delta2 = 1
-        else:
-            h2 = 0
-            delta2 = 0
-        
-        #print(delta1,delta2)
-        return (self.C * (abs(h1 + 1) * delta1)) + (self.C * (abs(h2 + 1) * delta2))
+
+        return (self.C * abs(h1 + 1) * delta1) + (self.C * abs(h2 + 1) * delta2)
 
     def find_constrained_action_space(self, unit, p_n_m_prev):
-        #print("This is the restrain action space Function")
-        p_min_i_loc = self.gen_chars.columns.get_loc("p_min_i")
-        p_max_i_loc = self.gen_chars.columns.get_loc("p_max_i")
-        dr_i_loc = self.gen_chars.columns.get_loc("dr_i")
-        ur_i_loc = self.gen_chars.columns.get_loc("ur_i")
+        """Find the set of valid actions respecting ramp-rate constraints.
 
-        p_min_n = self.gen_chars.iloc[unit-1, p_min_i_loc]
-        p_max_n = self.gen_chars.iloc[unit-1, p_max_i_loc]
-        dr_n = self.gen_chars.iloc[unit-1, dr_i_loc]
-        ur_n = self.gen_chars.iloc[unit-1, ur_i_loc]
-        
-        #unit_p_range = p_max_n - p_min_n
-        # 101 possible actions but 100 power segments in power range
-        num_action_p_segments = self.action_space.n - 1
-        action_p_per_segment = (p_max_n - p_min_n)/(num_action_p_segments)
-        current_action_number = int(round((p_n_m_prev - p_min_n)/(action_p_per_segment)))
+        Args:
+            unit: Generator number (1-indexed).
+            p_n_m_prev: Power output of this generator in the previous hour.
 
-        #print("curren action:",current_action_number)
-        
-        max_actions_down = int(round(dr_n/action_p_per_segment))
-        max_actions_up = int(round(ur_n/action_p_per_segment))
+        Returns:
+            numpy.ndarray of valid action indices.
+        """
+        p_min_n = self.gen_chars.iloc[unit - 1, 0]
+        p_max_n = self.gen_chars.iloc[unit - 1, 1]
+        dr_n = self.gen_chars.iloc[unit - 1, self.gen_chars.columns.get_loc("dr_i")]
+        ur_n = self.gen_chars.iloc[unit - 1, self.gen_chars.columns.get_loc("ur_i")]
 
-        if max_actions_down > current_action_number:
-            max_actions_down = current_action_number
-        
-        if max_actions_up + current_action_number > num_action_p_segments:
-            max_actions_up = num_action_p_segments - current_action_number
-        
-        #print(max_actions_down, max_actions_up, 1)
-        
-        
-        possible_actions = np.arange(current_action_number - max_actions_down, current_action_number + max_actions_up + 1)
-        #print(possible_actions)
-        return possible_actions
+        num_segments = self.action_space.n - 1  # 100
+        power_per_segment = (p_max_n - p_min_n) / num_segments
+
+        if power_per_segment == 0:
+            return np.array([0])
+
+        current_action = int(round((p_n_m_prev - p_min_n) / power_per_segment))
+        current_action = np.clip(current_action, 0, num_segments)
+
+        max_down = int(round(dr_n / power_per_segment))
+        max_up = int(round(ur_n / power_per_segment))
+
+        lower = max(0, current_action - max_down)
+        upper = min(num_segments, current_action + max_up)
+
+        return np.arange(lower, upper + 1)
 
     def step(self, action):
-        #print("action",action)
-        #print("hour:", self.hour_power_demand.index[self.m])
-        #print("p_n",self.set_p_n_m_a("unit1", self.hour_power_demand.index[self.m], action))
-        
-        # Move to next hour after updating all units
+        """Execute one step in the environment.
 
-        constrated_action_set  = self.find_constrained_action_space(self.n, self.get_p_n_m_prev(self.n , self.m))
+        The agent sets one generator's power level. After all 9 controllable
+        generators are set for an hour, the slack generator is computed and
+        the hour advances.
 
-        if action in constrated_action_set:
-            self.set_p_n_m_a(self.n, self.m, action) # Set power of all non-slack units given action
-            
-            #print(self.p_n_m.iloc[0,self.m])
-            #self.states_array[self.m]
-            #ur_i = self.gen_chars.loc[self.active_unit, "ur_i"]
-            #dr_i = self.gen_chars.loc[self.active_unit, "dr_i"]
-            # p_min_n = self.gen_chars.loc[self.active_unit, "p_min_i"]
-            # p_max_n = self.gen_chars.loc[self.active_unit, "p_max_i"]
-            # p_n = p_min_n + action * ((p_max_n - p_min_n) / self.action_space.n)
-            
-            #selfish
-            #rc=self.get_f_c_l(self.n,self.m)
-            #re=self.get_f_e_l(self.n,self.m)
-            
-            #cooperate
-            rc=0
-            re=0
-            rp=0
+        Args:
+            action: Integer in [0, 100].
 
-            #self.reward = -((self.Wc*rc)+(self.We*re)+(self.Wp*rp))
+        Returns:
+            tuple: (observation, reward, terminated, truncated, info)
+        """
+        action = int(action)
+        terminated = False
+        truncated = False
+        info = {}
+
+        constrained_actions = self.find_constrained_action_space(
+            self.n, self.get_p_n_m_prev(self.n, self.m)
+        )
+
+        if action in constrained_actions:
+            self.set_p_n_m_a(self.n, self.m, action)
+            # Dense reward: per-generator cost and emissions feedback
+            rc = self.get_f_c_l(self.n, self.m)
+            re = self.get_f_e_l(self.n, self.m)
+            rp = 0.0
+            info["action_valid"] = True
         else:
-            self.states_array[((self.n - 1) * (self.M - 1)) + (self.m - 1)][1] = self.states_array[((self.n - 1) * (self.M - 1)) + (self.m - 2)][1]
-            # Heavy neg reward for choosing impossible action. That'll teach him!
-            #selfish
-            #rc=1000000
-            #re=1000000
-            #cooperating
-            rc=1000000
-            re=1000000
-            rp=1000000
+            # Invalid action: copy previous hour's power (or keep at init)
+            prev_power = self.get_p_n_m_prev(self.n, self.m)
+            self.p_n_m_df.iloc[self.n - 1, self.m - 1] = prev_power
+            # BUG FIX 2: Use consistent indexing
+            self.states_array[((self.n - 1) * self.M) + (self.m - 1)][1] = prev_power
+            rc = 1000000.0
+            re = 1000000.0
+            rp = 1000000.0
+            info["action_valid"] = False
 
-        self.n+=1
-        
-        #selfish
-        #self.Wc = 0.5  # Cost weight used for linear scalarisation
-        #self.We = 0.5  # Emissions weight used for linear scalarisation
-        #self.reward = -((self.Wc*rc)+(self.We*re))
-        
-        #cooperate
-        self.reward = -((self.Wc*rc)+(self.We*re)+(self.Wp*rp))
-        if self.n==11:
-            self.get_p_1_m(self.m)
-            #selfish
-            #self.reward = -((self.Wc*rc)+(self.We*re))
-            #cooperate
-            rc=self.get_f_c_g(self.m)
-            re=self.get_f_e_g(self.m)
-            rp=self.get_f_p_g(self.m)
-            self.reward = -((self.Wc*rc)+(self.We*re)+(self.Wp*rp))
+        self.n += 1
+
+        # BUG FIX 6: Compute dense reward BEFORE any overwrite
+        reward = -(self.Wc * rc + self.We * re + self.Wp * rp)
+
+        # BUG FIX 1: Check termination BEFORE resetting n
+        if self.n == 11:
+            # All controllable generators set for this hour
+            self.get_p_1_m(self.m)  # Compute slack generator
+
+            # Full-hour cooperative reward replaces dense per-gen reward
+            rc = self.get_f_c_g(self.m)
+            re = self.get_f_e_g(self.m)
+            rp = self.get_f_p_g(self.m)
+            reward = -(self.Wc * rc + self.We * re + self.Wp * rp)
+
+            self.prev_cost = rc
+            self.prev_emissions = re
+
+            # Populate info with diagnostics
+            info["hour"] = self.m
+            info["hourly_cost"] = rc
+            info["hourly_emissions"] = re
+            info["hourly_penalty"] = rp
+            info["slack_power"] = self.get_p_n_m(1, self.m)
+            info["gen_powers"] = [
+                self.get_p_n_m(i, self.m) for i in range(1, self.N + 1)
+            ]
+            info["demand"] = self.get_p_d_m(self.m)
+
+            # Check termination: last generator of last hour
+            if self.m == self.M:
+                terminated = True
+                self.done = True
+                obs = self._build_observation()
+                return obs, reward, terminated, truncated, info
+
+            # Advance to next hour
             self.m += 1
-            self.n=2
+            self.n = 2
 
-        if self.n==11 and self.m==self.M:
-            #self.get_p_1_m(self.m)
-            #selfish
-            #self.reward = -((self.Wc*rc)+(self.We*re))
-            #cooperate
-            #rc=self.get_f_c_g(self.m)
-            #re=self.get_f_e_g(self.m)
-            #rp=self.get_f_p_g(self.m)
-            #self.reward = -((self.Wc*rc)+(self.We*re)+(self.Wp*rp))
-            self.done = True
-            print("Episode Complete.")
-            return [self.state, self.reward, self.done, self.add]
-        
-        self.state=((self.n - 1)*self.M) + (self.m)
+        self.reward = reward
+        obs = self._build_observation()
+        return obs, reward, terminated, truncated, info
 
-        return [self.state, self.reward, self.done, self.add]
+    def reset(self, seed=None, options=None):
+        """Reset the environment to the initial state.
+
+        Args:
+            seed: Optional random seed.
+            options: Optional dict of reset options.
+
+        Returns:
+            tuple: (observation, info)
+        """
+        super().reset(seed=seed, options=options)
+
+        self.m = 1
+        self.n = 2
+        self.done = False
+        self.reward = 0.0
+        self.prev_cost = 0.0
+        self.prev_emissions = 0.0
+
+        # BUG FIX 4: Reset instance-level mutable state
+        self.p_n_m_df = pd.DataFrame(
+            0.0,
+            columns=[f"hour{i}" for i in range(1, 25)],
+            index=[f"unit{i}" for i in range(1, 11)],
+        )
+        self._init_states_array()
+
+        # Set initial random power levels for hour 1 into p_n_m_df
+        for n in range(1, self.N + 1):
+            init_power = self.states_array[(n - 1) * self.M][1]
+            self.p_n_m_df.iloc[n - 1, 0] = init_power
+
+        obs = self._build_observation()
+        info = {"hour": self.m, "generator": self.n, "demand": self.get_p_d_m(self.m)}
+        return obs, info
 
     def render(self):
-        print("This is a render of the Generators Environment")
+        """Render the current environment state."""
+        if self.render_mode == "human":
+            print(f"Hour: {self.m}/{self.M}, Generator: {self.n}/{self.N}")
+            print(f"Demand: {self.get_p_d_m(self.m)} MW")
+            for i in range(1, self.N + 1):
+                print(f"  Unit {i}: {self.p_n_m_df.iloc[i-1, self.m-1]:.1f} MW")
 
-    def reset(self):
-        print("Generators Environment Reset")
-        self.m=1
-        self.n=2
-        self.states_array.fill(0.)
-        state_fill = 0
-        for n in range(1, self.N + 1): #Looping inclusive range
-            self.states_array[state_fill] = [0. , self.set_random_p_n_m(n)]
-            state_fill += self.M
-        # set power demand deltas
-        m = 0
-        for state in range(0, len(self.states_array)):
-            self.states_array[state][0] = self.hour_power_demand_diff.iloc[m , 0]
-            m+=1
-            if m == 24:
-                m=0
-        
-        # set init state to unit 2 hour 1
-        self.state = self.state=((self.n - 1)*self.M) + (self.m) 
-        self.done = False
-        self.add = [0, 0]
-        self.reward = 0
-        return self.state
-        # space = spaces.Discrete(24) # Set with 8 elements {0, 1, 2, ..., 23}
-        # self.action_space = spaces.Tuple((spaces.Discrete(101)))
-
-#gen_env1 = GeneratorsEnv()
-# sum =0
-# for n in range(2,gen_env1.N+1):
-#     for m in range(1, gen_env1.M+1):
-#         sum+=gen_env1.set_p_n_m_a(n,m,60)
-
-# for m in range(1, gen_env1.M+1):
-#     print(sum/24 + gen_env1.get_p_1_m(m))
-#for states in range(25, len(gen_env1.states_array)):
- #   print(gen_env1.step(gen_env1.action_space.sample()))  # Take random action
-
-#print(gen_env1.states_array)
-
-#print(gen_env1.B[9][9])
-#print(gen_env1.action_space.n)
-#print(gen_env1.get_p_l_m(1))
-
-#for n in range(2,gen_env1.N +1):
-#    gen_env1.set_p_n_m_a(n,1,0)
-
-#print(gen_env1.get_p_n_m_prev(10,1))
-#print(gen_env1.get_p_n_m(1,"hour1"))
-#print(gen_env1.get_f_p_g(1))
-#print(gen_env1.get_p_l_m(1)) # No real solution
-#print(gen_env1.get_p_1_m(1)) # Edited to only give one output
-
-
-
-
-
-# gen_env1.set_p_n_m_a(2,2,0)
-# print(gen_env1.get_p_n_m(2,2))
-# print(gen_env1.get_f_c_l(2,2))
-
-# gen_env1.set_p_n_m_a(2,2,1)
-# print(gen_env1.get_p_n_m(2,2))
-# print(gen_env1.get_f_c_l(2,2))
-
-# gen_env1.set_p_n_m_a(2,2,2)
-# print(gen_env1.get_p_n_m(2,2))
-# print(gen_env1.get_f_c_l(2,2))
-
-
-
-
-#print(gen_env1.get_f_c_g(1))
-#print(gen_env1.set_p_n_m_a(1,1,100))
-
-
-#print(gen_env1.get_f_e_l(1,1))
-#print(gen_env1.get_f_e_g(1))
-
-#print(gen_env1.set_random_p_n_m(1))
-#print(gen_env1.gen_chars.columns.get_loc("p_min_i"))
-#gen_env1.show_unit_characteristics("unit1")
-
-#for hour in range(1, gen_env1.M):
- #   print(gen_env1.get_p_d_m(hour))
-
-#unit = "unit1"
-#p_n_m = np.random.uniform(low=gen_env1.gen_chars.loc[unit, "p_min_i"],high=gen_env1.gen_chars.loc[unit, "p_max_i"])
-
-#print(gen_env1.get_f_c_l("unit1", "hour1"))
-#print(gen_env1.get_f_c_g("hour1"))
-#print(gen_env1.get_f_e_l("unit1", "hour1"))
-#print(gen_env1.get_f_e_g("hour1"))
-#print(gen_env1.get_p_d_m(1))
-#print(gen_env1.get_p_d_m_prev("hour2"))
-
-#gen_env1.find_constrained_action_space(3, 150)
-
-#print(gen_env1.get_f_p_g("hour1"))
+    def close(self):
+        """Clean up resources."""
+        pass
